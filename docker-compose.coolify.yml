@@ -1,18 +1,70 @@
 version: '3.8'
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: papermark-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-papermark}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-papermark}
+      POSTGRES_DB: ${POSTGRES_DB:-papermark}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+   # ports:
+   #   - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-papermark}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: papermark-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    container_name: papermark-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   app:
     build:
       context: .
       dockerfile: Dockerfile
+    container_name: papermark-app
     restart: unless-stopped
     ports:
       - "${APP_PORT:-25256}:3000"
     environment:
-      # Database - External PostgreSQL (provided by Coolify)
-      DATABASE_URL: ${DATABASE_URL}
-      POSTGRES_PRISMA_URL: ${DATABASE_URL}
-      POSTGRES_PRISMA_URL_NON_POOLING: ${DATABASE_URL}
+      # Database
+      DATABASE_URL: postgresql://papermark:papermark@postgres:5432/papermark?schema=public
+      POSTGRES_PRISMA_URL: postgresql://papermark:papermark@postgres:5432/papermark?schema=public
+      POSTGRES_PRISMA_URL_NON_POOLING: postgresql://papermark:papermark@postgres:5432/papermark?schema=public
       
       # Application
       NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:25256}
@@ -21,16 +73,24 @@ services:
       NEXT_PUBLIC_BASE_URL: ${NEXT_PUBLIC_URL:-http://localhost:25256}
       NEXT_PUBLIC_MARKETING_URL: ${NEXT_PUBLIC_URL:-http://localhost:25256}
       
-      # Storage
-      STORAGE_PROVIDER: ${STORAGE_PROVIDER:-vercel-blob}
-      BLOB_READ_WRITE_TOKEN: ${BLOB_READ_WRITE_TOKEN}
-      NEXT_PUBLIC_VERCEL_BLOB_BASE_URL: ${NEXT_PUBLIC_VERCEL_BLOB_BASE_URL}
+      # Storage - Using MinIO (S3 compatible)
+      STORAGE_PROVIDER: s3
+      NEXT_PUBLIC_UPLOAD_TRANSPORT: s3
       
-      # AWS S3 (if using S3 storage)
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
-      AWS_S3_BUCKET_NAME: ${AWS_S3_BUCKET_NAME}
-      AWS_S3_REGION: ${AWS_S3_REGION}
+      # AWS S3 compatibility settings for MinIO
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      AWS_S3_BUCKET_NAME: ${AWS_S3_BUCKET_NAME:-papermark-documents}
+      AWS_S3_REGION: ${AWS_S3_REGION:-us-east-1}
+      AWS_S3_ENDPOINT: http://minio:9000
+      
+      # Next Private Upload settings (required for Papermark)
+      NEXT_PRIVATE_UPLOAD_BUCKET: ${AWS_S3_BUCKET_NAME:-papermark-documents}
+      NEXT_PRIVATE_UPLOAD_REGION: ${AWS_S3_REGION:-us-east-1}
+      NEXT_PRIVATE_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      NEXT_PRIVATE_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      NEXT_PRIVATE_UPLOAD_ENDPOINT: http://minio:9000
+      NEXT_PRIVATE_UPLOAD_DISTRIBUTION_HOST: minio:9000
       
       # Email
       RESEND_API_KEY: ${RESEND_API_KEY}
@@ -50,11 +110,14 @@ services:
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
       NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: ${NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY}
       
-      # Upstash
-      UPSTASH_REDIS_REST_URL: ${UPSTASH_REDIS_REST_URL}
-      UPSTASH_REDIS_REST_TOKEN: ${UPSTASH_REDIS_REST_TOKEN}
-      UPSTASH_QSTASH_URL: ${UPSTASH_QSTASH_URL}
-      UPSTASH_QSTASH_TOKEN: ${UPSTASH_QSTASH_TOKEN}
+      # Redis (local replacement for Upstash)
+      REDIS_URL: redis://redis:6379
+      # Note: Upstash REST API not available in local Redis
+      # You may need to disable rate limiting or use alternative solution
+      UPSTASH_REDIS_REST_URL: ${UPSTASH_REDIS_REST_URL:-}
+      UPSTASH_REDIS_REST_TOKEN: ${UPSTASH_REDIS_REST_TOKEN:-}
+      UPSTASH_QSTASH_URL: ${UPSTASH_QSTASH_URL:-}
+      UPSTASH_QSTASH_TOKEN: ${UPSTASH_QSTASH_TOKEN:-}
       
       # Security
       DOCUMENT_ENCRYPTION_KEY: ${DOCUMENT_ENCRYPTION_KEY}
@@ -63,11 +126,42 @@ services:
       TRIGGER_SECRET_KEY: ${TRIGGER_SECRET_KEY}
       TRIGGER_API_URL: ${TRIGGER_API_URL}
       
+      # Hanko (Passkey authentication) - Dummy values to prevent startup errors
+      # Note: Passkey authentication will not work without valid credentials
+      HANKO_API_KEY: ${HANKO_API_KEY:-dummy-api-key}
+      NEXT_PUBLIC_HANKO_TENANT_ID: ${NEXT_PUBLIC_HANKO_TENANT_ID:-00000000-0000-0000-0000-000000000000}
+      
       # Node
       NODE_ENV: production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
+
+  # MinIO client to create initial bucket
+  createbuckets:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set myminio http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin};
+      /usr/bin/mc mb myminio/${AWS_S3_BUCKET_NAME:-papermark-documents} --ignore-existing;
+      /usr/bin/mc anonymous set public myminio/${AWS_S3_BUCKET_NAME:-papermark-documents};
+      exit 0;
+      "
+
+volumes:
+  postgres_data:
+  minio_data:
+  redis_data:
